@@ -1,0 +1,17 @@
+# Data is downloaded reproducibly by R/load_data.R — don't commit it.
+data/
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Rendered output (regenerated from the .Rmd)
+/*_files/
+/*_cache/
+churn-analysis.html
+
+# OS noise
+.DS_Store

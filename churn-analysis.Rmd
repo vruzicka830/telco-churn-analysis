@@ -1,0 +1,302 @@
+---
+title: "Predicting Customer Churn at a Telecom Company"
+subtitle: "A logistic regression analysis"
+author: "V. Ruzicka"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 4.5, dpi = 110
+)
+library(tidyverse)
+library(broom)
+library(pROC)
+library(scales)
+theme_set(theme_minimal(base_size = 12))
+set.seed(2024)   # reproducibility
+```
+
+# Executive summary
+
+Churn is expensive. Winning a new subscriber costs far more than keeping one
+you already have, so every customer who leaves for a competitor takes real
+margin with them. This analysis uses a public dataset of **7,032 telecom
+customers** to build a **logistic regression** model that predicts who is
+likely to churn and explains why.
+
+```{r load, include=FALSE}
+source("R/load_data.R")
+churn <- load_churn()
+overall_rate <- mean(churn$churn)
+```
+
+The short version: most churn traces back to two things, and the business can
+act on both of them. Contract type matters most. A two-year contract cuts the
+odds of churn by roughly 75% against month-to-month, and the risk keeps falling
+with every extra month a customer stays. The overall churn rate sits at
+**`r percent(overall_rate, accuracy = 0.1)`**, imbalanced but not lopsided.
+
+The rest is smaller stuff around the edges. Electronic-check payment, paperless
+billing, multiple phone lines, and senior-citizen status each nudge risk up by a
+modest, statistically significant amount. Monthly charges and fiber-optic
+internet are the interesting case: they *look* dangerous in the raw data, then
+wash out once tenure and total charges enter the model, because all three are
+carrying the same signal. The interpretation section pulls that apart.
+
+On a held-out test set the model lands at an **AUC of about 0.84**, enough to
+rank customers by risk and hand a retention team a list worth working.
+
+# The data
+
+The [Telco Customer Churn dataset](https://www.kaggle.com/datasets/blastchar/telco-customer-churn)
+contains one row per customer with their account details, the services they
+subscribe to, and whether they churned in the last month. The loading and
+cleaning logic lives in `R/load_data.R` (downloaded and cached automatically).
+
+```{r glimpse}
+glimpse(churn)
+```
+
+Most of the cleaning in `R/load_data.R` is routine factor conversion. The one
+judgment call worth flagging is `TotalCharges`: it arrives as text because 11
+brand-new customers have a blank value, so coercing it to numeric turns those
+into `NA`, and I drop them. At 0.2% of the data, that's a rounding error.
+`SeniorCitizen` also gets recoded from 0/1 to a readable factor, and `churn`
+becomes a 0/1 column for modeling.
+
+# Exploratory data analysis
+
+Before fitting anything, it pays to see how churn moves with a few key
+predictors. The patterns mostly foreshadow what the model finds, with one
+instructive exception.
+
+## How many customers churn?
+
+```{r eda-rate}
+churn |>
+  count(Churn) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(Churn, pct, fill = Churn)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -0.3) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Overall churn rate", x = NULL, y = "Share of customers") +
+  guides(fill = "none")
+```
+
+About one in four customers churned. That imbalance is mild, but it's enough to
+make raw accuracy misleading. A model that just guessed "no churn" for everyone
+would already score about `r percent(1 - overall_rate, accuracy = 1)`, so the
+evaluation below leans on AUC and the confusion matrix instead.
+
+## Churn by contract type
+
+```{r eda-contract}
+churn |>
+  group_by(Contract) |>
+  summarise(churn_rate = mean(churn), n = n()) |>
+  ggplot(aes(reorder(Contract, churn_rate), churn_rate, fill = Contract)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = percent(churn_rate, accuracy = 1)), hjust = -0.15) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Churn rate by contract type", x = NULL, y = "Churn rate") +
+  guides(fill = "none")
+```
+
+There's the whole analysis in one chart. **Month-to-month customers churn far
+more than anyone on a contract.** Getting customers onto a longer term is the
+most obvious lever the business has, and the model will back this up.
+
+## Tenure and monthly charges
+
+```{r eda-tenure}
+churn |>
+  ggplot(aes(tenure, fill = Churn)) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.6) +
+  labs(title = "Churn is concentrated among new customers",
+       x = "Tenure (months)", y = "Customers", fill = "Churned?")
+```
+
+```{r eda-charges}
+churn |>
+  ggplot(aes(Churn, MonthlyCharges, fill = Churn)) +
+  geom_boxplot(width = 0.5, alpha = 0.7) +
+  labs(title = "Churners pay more per month", x = NULL, y = "Monthly charges ($)") +
+  guides(fill = "none")
+```
+
+Two things stand out. Churn is heavily concentrated in a customer's first few
+months, and churners tend to pay more each month. Tenure goes on to be one of
+the model's strongest predictors. The monthly-charges signal does not: it mostly
+evaporates once the other variables are in the mix. That's the instructive
+exception flagged above, and a reminder that a single-variable chart can point
+the wrong way.
+
+# Modeling
+
+## Train/test split
+
+We hold out 25% of customers as a test set the model never sees during
+training, so our performance estimate reflects how the model would behave on
+genuinely new customers.
+
+```{r split}
+n         <- nrow(churn)
+train_idx <- sample(n, size = floor(0.75 * n))
+train     <- churn[train_idx, ]
+test      <- churn[-train_idx, ]
+
+c(train = nrow(train), test = nrow(test))
+```
+
+## Fitting a logistic regression
+
+We regress churn on every available predictor. Logistic regression gets the
+first look for one reason above all: it's **interpretable**. Every coefficient
+becomes a plain-English statement about odds, which is what a business audience
+actually wants. It happens to be well-behaved and hard to overfit on data this
+size too, but interpretability is why it's here.
+
+```{r fit}
+model <- glm(churn ~ . - Churn,        # all predictors except the text label
+             data = train, family = binomial)
+```
+
+```{r fit-summary}
+glance(model) |> select(null.deviance, deviance, AIC, df.residual)
+```
+
+# Evaluation
+
+## Discrimination: ROC and AUC
+
+AUC (area under the ROC curve) measures how well the model ranks a random
+churner above a random non-churner. 0.5 is a coin flip; 1.0 is perfect.
+
+```{r roc}
+test_prob <- predict(model, newdata = test, type = "response")
+roc_obj   <- roc(test$churn, test_prob, quiet = TRUE)
+auc_val   <- as.numeric(auc(roc_obj))
+
+ggroc(roc_obj, color = "#2c7fb8", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "grey60") +
+  labs(title = sprintf("ROC curve (test set AUC = %.3f)", auc_val),
+       x = "Specificity", y = "Sensitivity")
+```
+
+An AUC of **`r sprintf("%.3f", auc_val)`** indicates strong discrimination. The
+model is genuinely useful for ranking customers by risk.
+
+## Classification at a chosen threshold
+
+To turn probabilities into yes/no predictions we pick a threshold. The default
+0.5 maximizes accuracy, but for retention we often care more about *catching*
+churners (recall), so a business might lower it. Here we report the 0.5
+confusion matrix:
+
+```{r confusion}
+test_pred <- factor(if_else(test_prob > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+cm <- table(Predicted = test_pred, Actual = test$Churn)
+cm
+
+accuracy    <- sum(diag(cm)) / sum(cm)
+sensitivity <- cm["Yes", "Yes"] / sum(cm[, "Yes"])   # recall on churners
+specificity <- cm["No",  "No"]  / sum(cm[, "No"])
+tibble(accuracy, sensitivity, specificity) |>
+  mutate(across(everything(), ~ percent(.x, accuracy = 0.1)))
+```
+
+# Interpreting the drivers of churn
+
+Here's the payoff promised earlier. Exponentiate a coefficient and you get an
+**odds ratio**: the factor by which the odds of churn change for a one-unit (or
+one-category) move in that predictor, with everything else held fixed. Above 1
+means more risk, below 1 means less.
+
+```{r odds-ratios}
+or_table <- tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)", p.value < 0.05) |>
+  arrange(desc(estimate)) |>
+  select(term, odds_ratio = estimate, conf.low, conf.high, p.value)
+
+or_table |>
+  mutate(across(c(odds_ratio, conf.low, conf.high), ~ round(.x, 2)),
+         p.value = signif(p.value, 2))
+```
+
+```{r odds-plot, fig.height=6}
+or_table |>
+  mutate(term = reorder(term, odds_ratio)) |>
+  ggplot(aes(odds_ratio, term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey60") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), color = "#2c7fb8") +
+  scale_x_log10() +
+  labs(title = "Significant churn drivers (odds ratios, log scale)",
+       subtitle = "Right of the dashed line = increases churn risk",
+       x = "Odds ratio (95% CI)", y = NULL)
+```
+
+The dominant drivers line up with intuition: **month-to-month contracts and
+short tenure** carry the most risk, while one- and two-year contracts are
+strongly protective (a two-year contract cuts the odds of churn by roughly
+75%). Electronic-check payment, paperless billing, multiple phone lines, and
+senior-citizen status each add smaller but significant risk.
+
+One result deserves a second look: **`MonthlyCharges` and fiber-optic internet
+are *not* statistically significant in the model**, even though the EDA showed
+churners paying more. These billing variables are highly collinear.
+`TotalCharges` is essentially tenure times `MonthlyCharges`, and the
+fiber-optic customers are the same people paying the most, so once tenure and
+total charges are in the model they absorb that signal. A coefficient measured
+alongside other variables answers a different question than a raw EDA chart,
+which is why "price doesn't matter" would be the wrong conclusion to draw from a
+single p-value. The right next step is to address the collinearity (drop the
+redundant billing terms or combine them) before making any pricing decision.
+
+# Recommendations
+
+1. **Convert month-to-month customers to longer contracts.** This is the
+   largest, most actionable lever. Targeted incentives (discounts, perks) for
+   signing a one- or two-year term should pay for themselves.
+2. **Intervene early.** Churn risk is highest in the first months. A structured
+   onboarding / early-life retention program targets customers when they are
+   most vulnerable.
+3. **Reduce payment friction.** Electronic-check payment and paperless billing
+   are significant, independent risk factors, so a nudge toward automatic
+   payment methods is worth an A/B test. (Fiber-optic customers churn more in the raw data,
+   but that is collinear with price; investigate it via the billing variables,
+   not as a standalone effect.)
+4. **Operationalize the model.** Score the active customer base monthly and
+   route the top-risk decile to the retention team. The AUC of
+   `r sprintf("%.2f", auc_val)` means this list will be meaningfully better
+   than random outreach.
+
+# Limitations & next steps
+
+- This is observational data: the odds ratios describe **associations**, not
+  proven causes. A real retention experiment (A/B test) would be needed to
+  confirm that, e.g., pushing contracts *causes* lower churn.
+- Logistic regression assumes roughly additive effects on the log-odds scale.
+  A natural next step is to compare against a tree-based model (random forest /
+  gradient boosting) to check whether interactions or non-linearities improve
+  predictive performance, at some cost to interpretability.
+- Threshold choice should be tied to the actual economics (cost of a retention
+  offer vs. value of a saved customer), which would let us optimize expected
+  profit rather than a generic metric.
+
+---
+
+*Reproduce this analysis end-to-end by cloning the repo, installing `tidyverse`,
+`broom`, `pROC`, `scales`, and `rmarkdown`, and rendering this file with*
+`rmarkdown::render("churn-analysis.Rmd")`.
