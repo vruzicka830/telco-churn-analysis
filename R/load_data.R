@@ -4,14 +4,17 @@
 # the whole analysis reproducible: anyone who clones the repo gets the same
 # data by running the same code.
 
-library(readr)
-library(dplyr)
+library(readr) # For read_csv.
+library(dplyr) # For mutate, filter, select, across, where, if_else.
 
+# Global constants.
 # IBM's public copy of the classic Telco Customer Churn dataset.
 DATA_URL  <- "https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv"
-DATA_DIR  <- "data"
+DATA_DIR  <- "data" # Relative to cwd.
+# file.path is base R. Joins dir + filename with OS-correct separator.
 RAW_PATH  <- file.path(DATA_DIR, "telco-churn-raw.csv")
 
+# Apostrophe indicates a documentation comment (would create documentation for function if this where a package).
 #' Download the raw CSV once and cache it locally.
 download_churn <- function(force = FALSE) {
   if (!dir.exists(DATA_DIR)) dir.create(DATA_DIR, recursive = TRUE)
@@ -19,7 +22,7 @@ download_churn <- function(force = FALSE) {
     message("Downloading Telco churn data ...")
     download.file(DATA_URL, RAW_PATH, mode = "wb", quiet = TRUE)
   }
-  RAW_PATH
+  RAW_PATH # return
 }
 
 #' Load and clean the dataset, returning an analysis-ready tibble.
@@ -37,8 +40,8 @@ load_churn <- function() {
     mutate(SeniorCitizen = if_else(SeniorCitizen == 1, "Yes", "No")) |>
     # The outcome: a 0/1 column for modeling plus the original label.
     mutate(churn = if_else(Churn == "Yes", 1L, 0L)) |>
-    # customerID is an identifier, not a predictor.
+    # customerID is an identifier, not a predictor (model could overfit/memorize id's and associated outcomes).
     select(-customerID) |>
-    # Turn every remaining text column into a factor (what models expect).
+    # Turn every remaining text column into a factor (what models expect, i.e., a data type for categorical data).
     mutate(across(where(is.character), as.factor))
 }
